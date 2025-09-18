@@ -1,18 +1,21 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { createWriteStream } from 'node:fs';
 import { request } from 'undici';
 import cliProgress from 'cli-progress';
 import minimist from 'minimist';
+import archiver from 'archiver';
 
 // CLI引数処理
 const args = minimist(process.argv.slice(2));
 const magazineId = args.magazineId;
 const volumeOnly = args['volume-only'] || false;
 const volumeDigits = parseInt(args['volume-digits']) || 2;
+const useZip = args.zip || false;
 
 if (!magazineId) {
-  console.error('Usage: bun index.js --magazineId=<id> [--volume-only] [--volume-digits=<n>]');
+  console.error('Usage: bun index.js --magazineId=<id> [--volume-only] [--volume-digits=<n>] [--zip]');
   process.exit(1);
 }
 
@@ -176,6 +179,69 @@ async function downloadImage(url, filePath, retries = 3) {
   return false;
 }
 
+// 画像をzipファイルに追加する関数
+async function addImageToZip(url, zipFileName, imageName, archive, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const { body, statusCode } = await request(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Referer': 'https://note.com/',
+          'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+          'Accept-Encoding': 'gzip, deflate, br'
+        }
+      });
+
+      if (statusCode !== 200) {
+        console.error(`HTTP ${statusCode} for image ${url}`);
+        if (i === retries - 1) return false;
+        continue;
+      }
+
+      const buffer = await body.arrayBuffer();
+      archive.append(Buffer.from(buffer), { name: imageName });
+      return true;
+    } catch (error) {
+      console.error(`Download failed for ${url} (attempt ${i + 1}):`, error.message);
+      if (i === retries - 1) {
+        return false;
+      }
+      // リトライ前に少し待つ
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+  return false;
+}
+
+// zipファイルを作成する関数
+async function createZipFile(zipPath, images, title) {
+  return new Promise((resolve, reject) => {
+    const output = createWriteStream(zipPath);
+    const archive = archiver('zip', {
+      zlib: { level: 9 } // 最高圧縮
+    });
+
+    output.on('close', () => {
+      resolve();
+    });
+
+    archive.on('error', (err) => {
+      reject(err);
+    });
+
+    archive.pipe(output);
+
+    // 画像をzipに追加
+    images.forEach((imageUrl, index) => {
+      const imageName = `${(index + 1).toString().padStart(3, '0')}.jpg`;
+      archive.append(null, { name: imageName });
+      // 実際の画像データは後で追加
+    });
+
+    archive.finalize();
+  });
+}
+
 // フォルダ名を安全にする関数
 function sanitizeFolderName(name) {
   if (volumeOnly) {
@@ -214,6 +280,9 @@ function sanitizeFolderName(name) {
 // メイン処理
 async function main() {
   console.log(`Starting download for magazine ID: ${magazineId}`);
+  if (useZip) {
+    console.log('Using ZIP mode - files will be compressed into ZIP archives');
+  }
 
   const articles = await getMagazineArticles(magazineId);
   console.log(`Found ${articles.length} articles.`);
@@ -247,23 +316,85 @@ async function main() {
   const baseDir = join('downloads', magazineId.toString());
   await mkdir(baseDir, { recursive: true });
 
-  // 各記事の画像をダウンロード
-  for (const { title, images } of articleData) {
-    const sanitizedTitle = sanitizeFolderName(title);
-    const articleDir = join(baseDir, sanitizedTitle);
-    await mkdir(articleDir, { recursive: true });
+  if (useZip) {
+    // ZIPモード
+    for (const { title, images } of articleData) {
+      const sanitizedTitle = sanitizeFolderName(title);
+      const zipPath = join(baseDir, `${sanitizedTitle}.zip`);
 
-    for (let i = 0; i < images.length; i++) {
-      const imageUrl = images[i];
-      const fileName = `${(i + 1).toString().padStart(3, '0')}.jpg`;
-      const filePath = join(articleDir, fileName);
-
-      const success = await downloadImage(imageUrl, filePath);
-      if (success) {
-        downloadedCount++;
+      // ZIPファイルが存在する場合はスキップ
+      if (existsSync(zipPath)) {
+        downloadedCount += images.length;
         progressBar.update(downloadedCount);
-      } else {
-        console.error(`Failed to download ${imageUrl}`);
+        continue;
+      }
+
+      try {
+        const output = createWriteStream(zipPath);
+        const archive = archiver('zip', {
+          zlib: { level: 9 } // 最高圧縮
+        });
+
+        await new Promise((resolve, reject) => {
+          output.on('close', () => {
+            resolve();
+          });
+
+          archive.on('error', (err) => {
+            reject(err);
+          });
+
+          archive.pipe(output);
+
+          // 画像を順次追加
+          let imageIndex = 0;
+          const addNextImage = async () => {
+            if (imageIndex >= images.length) {
+              archive.finalize();
+              return;
+            }
+
+            const imageUrl = images[imageIndex];
+            const imageName = `${(imageIndex + 1).toString().padStart(3, '0')}.jpg`;
+
+            const success = await addImageToZip(imageUrl, zipPath, imageName, archive);
+            if (success) {
+              downloadedCount++;
+              progressBar.update(downloadedCount);
+            } else {
+              console.error(`Failed to add ${imageUrl} to ZIP`);
+            }
+
+            imageIndex++;
+            addNextImage();
+          };
+
+          addNextImage();
+        });
+      } catch (error) {
+        console.error(`Error creating ZIP for ${sanitizedTitle}:`, error.message);
+      }
+    }
+  } else {
+    // 通常モード（フォルダ作成）
+    // 各記事の画像をダウンロード
+    for (const { title, images } of articleData) {
+      const sanitizedTitle = sanitizeFolderName(title);
+      const articleDir = join(baseDir, sanitizedTitle);
+      await mkdir(articleDir, { recursive: true });
+
+      for (let i = 0; i < images.length; i++) {
+        const imageUrl = images[i];
+        const fileName = `${(i + 1).toString().padStart(3, '0')}.jpg`;
+        const filePath = join(articleDir, fileName);
+
+        const success = await downloadImage(imageUrl, filePath);
+        if (success) {
+          downloadedCount++;
+          progressBar.update(downloadedCount);
+        } else {
+          console.error(`Failed to download ${imageUrl}`);
+        }
       }
     }
   }
